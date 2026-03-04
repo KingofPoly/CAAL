@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-__all__ = ["LLMProvider", "LLMResponse", "ToolCall"]
+__all__ = ["LLMProvider", "LLMResponse", "TokenUsage", "ToolCall"]
 
 
 @dataclass
@@ -27,11 +27,20 @@ class ToolCall:
 
 
 @dataclass
+class TokenUsage:
+    """Token counts from an LLM API call."""
+
+    prompt_tokens: int
+    completion_tokens: int
+
+
+@dataclass
 class LLMResponse:
     """Normalized LLM response representation."""
 
     content: str | None
     tool_calls: list[ToolCall]
+    usage: TokenUsage | None = None
 
 
 class LLMProvider(ABC):
@@ -99,6 +108,25 @@ class LLMProvider(ABC):
             String chunks of the response content
         """
         ...
+
+    def prepare_tools(
+        self,
+        tools: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Prepare tool definitions for this provider's model.
+
+        Override to modify tool definitions before they're sent to the model.
+        For example, stripping descriptions for models that only need schemas.
+
+        Default implementation returns tools unchanged.
+
+        Args:
+            tools: List of tool definitions in OpenAI format
+
+        Returns:
+            Possibly modified list of tool definitions
+        """
+        return tools
 
     def parse_tool_arguments(self, arguments: Any) -> dict[str, Any]:
         """Parse tool call arguments to dict.

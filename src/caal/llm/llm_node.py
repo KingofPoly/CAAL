@@ -115,7 +115,9 @@ async def llm_node(
         )
 
         # Discover tools from agent and MCP servers
-        tools = await _discover_tools(agent)
+        tools = await _discover_tools(agent, provider)
+        if not tools:
+            logger.warning("No tools discovered")
 
         # If tools available, loop non-streaming calls to support chaining
         # Model can call tool A → get result → call tool B → get result → text
@@ -174,6 +176,7 @@ async def llm_node(
                     if response.content:
                         # Don't clear tool status — keep indicator showing
                         # which tools were used for this response
+                        _emit_usage(agent, provider)
                         yield strip_markdown_for_tts(response.content)
                         return
                     break  # No content either, fall through to streaming
@@ -243,9 +246,19 @@ async def llm_node(
             async for chunk in provider.chat_stream(messages=messages):
                 yield strip_markdown_for_tts(chunk)
 
+        # Report token usage from final LLM call
+        _emit_usage(agent, provider)
+
     except Exception as e:
         logger.error(f"Error in llm_node: {e}", exc_info=True)
         yield f"I encountered an error: {e}"
+
+
+def _emit_usage(agent, provider) -> None:
+    """Report token usage from provider to agent callback if available."""
+    last_usage = getattr(provider, "_last_usage", None)
+    if last_usage and hasattr(agent, "_on_usage") and agent._on_usage:
+        agent._on_usage(last_usage)
 
 
 def _strip_tool_messages(messages: list[dict]) -> list[dict]:
@@ -290,11 +303,14 @@ def _build_messages_from_context(
 ) -> list[dict]:
     """Build messages with sliding window and context injection.
 
+    Dynamic context (tool cache, memory) is appended to the system prompt
+    rather than injected as separate system messages. This keeps a single
+    [SYSTEM_PROMPT] block in the rendered prompt, matching the format the
+    model was trained on.
+
     Message order:
-    1. System prompt (always first, never trimmed)
-    2. Tool data context (injected from cache)
-    3. Short-term memory context (awareness hint for tool chaining)
-    4. Chat history (sliding window applied)
+    1. System prompt + appended context (always first, never trimmed)
+    2. Chat history (sliding window applied)
 
     Args:
         chat_ctx: LiveKit chat context
@@ -352,22 +368,24 @@ def _build_messages_from_context(
     # Build final message list
     messages = []
 
-    # 1. System prompt always first
+    # 1. System prompt with dynamic context appended (single [SYSTEM_PROMPT] block)
     if system_prompt:
-        messages.append(system_prompt)
+        system_content = system_prompt["content"]
 
-    # 2. Inject tool data context
-    if tool_data_cache:
-        context = tool_data_cache.get_context_message()
-        if context:
-            messages.append({"role": "system", "content": context})
+        # Append tool data context
+        if tool_data_cache:
+            context = tool_data_cache.get_context_message()
+            if context:
+                system_content += f"\n\n{context}"
 
-    # 3. Inject short-term memory context (only after user has spoken)
-    has_user_message = any(m["role"] == "user" for m in chat_messages)
-    if short_term_memory and has_user_message:
-        memory_context = short_term_memory.get_context_message()
-        if memory_context:
-            messages.append({"role": "system", "content": memory_context})
+        # Append short-term memory context (only after user has spoken)
+        has_user_message = any(m["role"] == "user" for m in chat_messages)
+        if short_term_memory and has_user_message:
+            memory_context = short_term_memory.get_context_message()
+            if memory_context:
+                system_content += f"\n\n{memory_context}"
+
+        messages.append({"role": "system", "content": system_content})
 
     # 4. Apply sliding window to chat history
     # max_turns * 2 accounts for user + assistant pairs
@@ -381,11 +399,17 @@ def _build_messages_from_context(
     return messages
 
 
-async def _discover_tools(agent) -> list[dict] | None:
+async def _discover_tools(agent, provider: LLMProvider | None = None) -> list[dict] | None:
     """Discover tools from agent methods and MCP servers.
 
     Tools are cached on the agent instance after first discovery to avoid
     redundant MCP API calls on every user utterance.
+
+    Args:
+        agent: The agent instance (VoiceAssistant or ToolContext)
+        provider: LLM provider — used to call prepare_tools() for
+            model-specific tool transformations (e.g. stripping descriptions
+            for FunctionGemma)
     """
     # Return cached tools if available
     if hasattr(agent, "_llm_tools_cache") and agent._llm_tools_cache is not None:
@@ -461,6 +485,15 @@ async def _discover_tools(agent) -> list[dict] | None:
     # Add Home Assistant tools (only if HASS is connected)
     if hasattr(agent, "_hass_tool_definitions") and agent._hass_tool_definitions:
         tools.extend(agent._hass_tool_definitions)
+
+    # Add agent-level tools (memory_short, web_search — non-LiveKit callers)
+    if hasattr(agent, "_agent_tool_definitions") and agent._agent_tool_definitions:
+        tools.extend(agent._agent_tool_definitions)
+
+    # Let provider transform tools for its model (e.g. strip descriptions
+    # for FunctionGemma).  Applied once before caching.
+    if tools and provider is not None:
+        tools = provider.prepare_tools(tools)
 
     # Cache tools on agent and return
     result = tools if tools else None
